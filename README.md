@@ -53,7 +53,7 @@ Because compiled Go binaries are incredibly lightweight, this multi-cloud archit
 - **A Domain Name** (e.g., `example.com`). You need DNS records pointing to your nodes (e.g., `node1.example.com`, `node2.example.com`) to obtain valid TLS certificates through [Certbot](https://certbot.eff.org/).
 - **A Telegram Account** to interact with the bot.
 
-> *A note on Telegram: While I don't hold a strong opinion one way or the other about Telegram and their ethics, I acknowledge that others do for what are very valid reasons. I chose the Telegram Bot API as the communication backbone because of the simplicity and ease of use its API offers for two way communication between a user and a bot. While similar results could be achieved with e-mail, a Discord bot, or other services, this was the easiest method available to me. I'd welcome any pull requests enabling additional platforms for those who do not wish to use Telegram.*
+> **A Note on Telegram:** While I don't hold a strong opinion one way or the other about Telegram and their ethics, I acknowledge that others do for what are very valid reasons. I chose the Telegram Bot API as the communication backbone because of the simplicity and ease of use its API offers for two way communication between a user and a bot. While similar results could be achieved with e-mail, a Discord bot, or other services, this was the easiest method available to me. I'd welcome any pull requests enabling additional platforms for those who do not wish to use Telegram.*
 
 ## Step 1: Telegram Bot Setup
 
