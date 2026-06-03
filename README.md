@@ -104,7 +104,7 @@ It is recommended you add permissions and a post-renewal hook to configure your 
 
 **3. Create a Dedicated Service User**
 
-Run the service under its own user. Config files contain secrets (SMTP passwords, API tokens) so permissions must be locked down.
+Run the service under its own user. For the purposes of this README, it is assumed you are using the user `deadman`. Config files contain secrets (SMTP passwords, API tokens) so permissions must be locked down.
 
 ```bash
 useradd --system --no-create-home deadman
@@ -137,8 +137,8 @@ Because the script runs as a non-root user but needs to copy files into `/etc/de
 ```
 your-user ALL=(ALL) NOPASSWD: /usr/bin/cp /path/to/certbot/live/node1.yourdomain.com/fullchain.pem /etc/deadman-switch/certs/fullchain.pem
 your-user ALL=(ALL) NOPASSWD: /usr/bin/cp /path/to/certbot/live/node1.yourdomain.com/privkey.pem /etc/deadman-switch/certs/privkey.pem
-your-user ALL=(ALL) NOPASSWD: /usr/bin/chown deadman:deadman /etc/deadman-switch/certs/fullchain.pem
-your-user ALL=(ALL) NOPASSWD: /usr/bin/chown deadman:deadman /etc/deadman-switch/certs/privkey.pem
+your-user ALL=(ALL) NOPASSWD: /usr/bin/chown deadman\:deadman /etc/deadman-switch/certs/fullchain.pem
+your-user ALL=(ALL) NOPASSWD: /usr/bin/chown deadman\:deadman /etc/deadman-switch/certs/privkey.pem
 your-user ALL=(ALL) NOPASSWD: /usr/bin/chmod 400 /etc/deadman-switch/certs/fullchain.pem
 your-user ALL=(ALL) NOPASSWD: /usr/bin/chmod 400 /etc/deadman-switch/certs/privkey.pem
 your-user ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart deadman
