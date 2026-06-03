@@ -1,0 +1,25 @@
+{
+  "node_id": "node1.example.com",
+  "address": "node1.example.com:8443",
+  "peers": ["node2.example.com:8443", "node3.example.com:8443"],
+  "data_dir": "/var/lib/deadman/raft",
+  "duration": "21d",
+  "telegram_token": "1234567890:abcdefghijklkmnopqrstuvwxyzABCDEFGH",
+  "payload_path": "/var/lib/deadman/payload.sh",
+  "cert_file": "/etc/deadman-switch/certs/fullchain.pem",
+  "key_file": "/etc/deadman-switch/certs/privkey.pem",
+
+  "telegram_chat_id": 0,
+  "telegram_thread_id": 0,
+  "announce_topology": true,
+  "answer_offset": 3,
+  "communication_time": 120,
+
+  "smtp_host": "smtp.email.com",
+  "smtp_port": 465,
+  "smtp_tls": true,
+  "smtp_user": "username@email.com",
+  "smtp_password": "smtp_password",
+  "smtp_sender": "username@email.com",
+  "smtp_recipient": "username@email.com"
+}

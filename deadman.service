@@ -1,0 +1,17 @@
+[Unit]
+Description=Deadman Switch (Raft Cluster)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deadman
+Group=deadman
+# Ensure the deadman user can read the certs (see Step 2 in README: copy to /etc/deadman-switch/certs/, chown deadman:deadman, chmod 400)
+ExecStart=/usr/local/bin/deadman-switch -config /etc/deadman-switch/config.json
+Restart=always
+RestartSec=10s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
