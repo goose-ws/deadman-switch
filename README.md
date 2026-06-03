@@ -1,4 +1,4 @@
-![alt text](https://github.com/goose-ws/scribble/blob/main/logo.png?raw=true "Deadman's Switch")
+![alt text](https://github.com/goose-ws/deadman-switch/blob/main/logo.png?raw=true "Deadman's Switch")
 
 # Distributed Deadman's Switch
 
