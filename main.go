@@ -41,8 +41,8 @@ type Config struct {
 	CACert    string   `json:"ca_cert,omitempty"`
 	Duration  string   `json:"duration,omitempty"`
 
-	TelegramToken string `json:"telegram_token"`
-	PayloadPath   string `json:"payload_path"`
+	TelegramToken     string  `json:"telegram_token"`
+	PayloadPath       string  `json:"payload_path"`
 	TelegramChatID    int64   `json:"telegram_chat_id,omitempty"`
 	TelegramThreadID  int64   `json:"telegram_thread_id,omitempty"`
 	AnnounceTopology  bool    `json:"announce_topology,omitempty"`
@@ -315,6 +315,19 @@ func sendWarning(bot *tgbotapi.BotAPI, conf Config, chatID int64, subject, text 
 	}
 }
 
+// Dynamically retrieves a Telegram Bot API instance and handles failure gracefully
+func initBot(token string) *tgbotapi.BotAPI {
+	if token == "" {
+		return nil
+	}
+	bot, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		log.Printf("⚠️ Telegram Init Failed: %v", err)
+		return nil
+	}
+	return bot
+}
+
 // --- Cert Expiry Check ---
 
 func checkCertExpiry(conf Config, state DeadmanState) {
@@ -375,16 +388,12 @@ func checkCertExpiry(conf Config, state DeadmanState) {
 
 	log.Printf("%s", logMsg)
 
-	if conf.TelegramToken == "" {
+	bot := initBot(conf.TelegramToken)
+	if bot == nil {
 		return
 	}
 	chatID := effectiveChatID(conf, state)
 	if chatID == 0 {
-		return
-	}
-	bot, err := tgbotapi.NewBotAPI(conf.TelegramToken)
-	if err != nil {
-		log.Printf("⚠️ CERT CHECK: Could not init Telegram bot for cert warning: %v", err)
 		return
 	}
 	msg := tgbotapi.NewMessage(chatID, tgMsg)
@@ -424,8 +433,6 @@ func main() {
 	}
 
 	log.Printf("🚀 Starting Deadman Switch Node: %s", conf.NodeID)
-
-	checkCertExpiry(conf, fsm.state)
 
 	tlsConfig, err := setupTLS(conf)
 	if err != nil {
@@ -478,6 +485,8 @@ func main() {
 		log.Fatalf("Fatal: Raft init error: %v", err)
 	}
 
+	checkCertExpiry(conf, fsm.state)
+
 	go func() {
 		for {
 			select {
@@ -515,6 +524,7 @@ func main() {
 	go monitorLeadership(r, notifyCh, fsm, conf)
 	go runControlLoop(r, fsm, conf, tlsConfig)
 	go monitorClusterHealth(r, fsm, conf, tlsConfig)
+	go monitorCertExpiry(conf, fsm)
 	go runMonthlyTest(r, fsm, conf)
 	go runTestWatcher(r, fsm, conf, tlsConfig)
 
@@ -554,7 +564,7 @@ func handleInternalRPC(conn net.Conn, r *raft.Raft, fsm *DeadmanFSM) {
 	fsm.mu.RUnlock()
 
 	if latest.TestSeq != payload.Seq {
-		return 
+		return
 	}
 
 	if latest.TestResults == nil {
@@ -567,9 +577,25 @@ func handleInternalRPC(conn net.Conn, r *raft.Raft, fsm *DeadmanFSM) {
 	proposeState(r, latest)
 }
 
+// monitorCertExpiry re-runs checkCertExpiry on a schedule so the "expiring
+// soon" / "expired" alerts fire even if the process happens to stay up
+// (through a renewal window) for weeks between restarts - checkCertExpiry
+// on its own only ever runs once, at startup.
+func monitorCertExpiry(conf Config, fsm *DeadmanFSM) {
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		fsm.mu.RLock()
+		fsmState := fsm.state
+		fsm.mu.RUnlock()
+		checkCertExpiry(conf, fsmState)
+	}
+}
+
 // --- Cluster Health Monitor ---
 func monitorClusterHealth(r *raft.Raft, fsm *DeadmanFSM, conf Config, t *tls.Config) {
-	bot, _ := tgbotapi.NewBotAPI(conf.TelegramToken)
+	var bot *tgbotapi.BotAPI
 	peerUp := make(map[string]bool)
 	for _, peer := range conf.Peers {
 		peerUp[peer] = true
@@ -607,17 +633,24 @@ func monitorClusterHealth(r *raft.Raft, fsm *DeadmanFSM, conf Config, t *tls.Con
 			} else {
 				log.Printf("   ❌ Peer DOWN: %s (%v)", peer, err)
 			}
-			
-			if wasUp := peerUp[peer]; isUp != wasUp && conf.AnnounceTopology && bot != nil && chatID != 0 && r.State() == raft.Leader {
-				var text string
-				if isUp {
-					text = fmt.Sprintf("✅ *Node* `%s` *has reconnected.*", peer)
-				} else {
-					text = fmt.Sprintf("❌ *Node* `%s` *has disconnected.*", peer)
+
+			if wasUp := peerUp[peer]; isUp != wasUp && conf.AnnounceTopology && chatID != 0 && r.State() == raft.Leader {
+				if bot == nil {
+					bot = initBot(conf.TelegramToken)
 				}
-				msg := newMsg(chatID, text)
-				msg.ParseMode = "Markdown"
-				sendMsg(bot, conf, msg)
+				if bot != nil {
+					var text string
+					if isUp {
+						text = fmt.Sprintf("✅ *Node* `%s` *has reconnected.*", peer)
+					} else {
+						text = fmt.Sprintf("❌ *Node* `%s` *has disconnected.*", peer)
+					}
+					msg := newMsg(chatID, text)
+					msg.ParseMode = "Markdown"
+					sendMsg(bot, conf, msg)
+				} else {
+					log.Printf("⚠️ Skipping topology announcement for %s, Telegram bot not initialized.", peer)
+				}
 			}
 			peerUp[peer] = isUp
 		}
@@ -626,22 +659,30 @@ func monitorClusterHealth(r *raft.Raft, fsm *DeadmanFSM, conf Config, t *tls.Con
 
 // --- Leadership Monitor ---
 func monitorLeadership(r *raft.Raft, notifyCh chan bool, fsm *DeadmanFSM, conf Config) {
-	bot, _ := tgbotapi.NewBotAPI(conf.TelegramToken)
+	var bot *tgbotapi.BotAPI
 	lastNotifiedLeader := ""
 
 	for isLeader := range notifyCh {
 		if isLeader {
 			log.Printf("👑 STATE CHANGE: I have become the LEADER (%s)", conf.NodeID)
-			if bot != nil && conf.AnnounceTopology && conf.NodeID != lastNotifiedLeader {
+			if conf.AnnounceTopology && conf.NodeID != lastNotifiedLeader {
 				fsm.mu.RLock()
 				fsmState := fsm.state
 				fsm.mu.RUnlock()
 				chatID := effectiveChatID(conf, fsmState)
+				
 				if chatID != 0 {
-					msg := newMsg(chatID, fmt.Sprintf(
-						"⚠️ *Topology Change:* Node `%s` has assumed Leadership.", conf.NodeID))
-					msg.ParseMode = "Markdown"
-					sendMsg(bot, conf, msg)
+					if bot == nil {
+						bot = initBot(conf.TelegramToken)
+					}
+					if bot != nil {
+						msg := newMsg(chatID, fmt.Sprintf(
+							"⚠️ *Topology Change:* Node `%s` has assumed Leadership.", conf.NodeID))
+						msg.ParseMode = "Markdown"
+						sendMsg(bot, conf, msg)
+					} else {
+						log.Printf("⚠️ Skipping leadership announcement, Telegram bot not initialized.")
+					}
 				}
 				lastNotifiedLeader = conf.NodeID
 			}
@@ -690,7 +731,7 @@ func initiateTest(r *raft.Raft, fsm *DeadmanFSM, conf Config, triggeredBy string
 	}
 }
 
-// Helper to chunk large log outputs and safely send them via Telegram API 
+// Helper to chunk large log outputs and safely send them via Telegram API
 func sendChunkedOutput(bot *tgbotapi.BotAPI, conf Config, chatID int64, nodeName, icon, cleanOut string) {
 	header := fmt.Sprintf("🖥️ *%s* %s\n", nodeName, icon)
 
@@ -701,7 +742,7 @@ func sendChunkedOutput(bot *tgbotapi.BotAPI, conf Config, chatID int64, nodeName
 		return
 	}
 
-	// Telegram allows 4096 characters. We use 3900 to ensure we have room for the 
+	// Telegram allows 4096 characters. We use 3900 to ensure we have room for the
 	// Markdown formatting code blocks (```text \n ... \n```) and the node header.
 	runes := []rune(cleanOut)
 	maxLen := 3900
@@ -737,7 +778,7 @@ func sendChunkedOutput(bot *tgbotapi.BotAPI, conf Config, chatID int64, nodeName
 		msgText := partHeader + "```text\n" + chunkText + "\n```"
 		msg := newMsg(chatID, msgText)
 		msg.ParseMode = "Markdown"
-		
+
 		if _, err := sendMsg(bot, conf, msg); err != nil {
 			log.Printf("⚠️ FAILED TO SEND TEST CHUNK to %s: %v", nodeName, err)
 		}
@@ -795,7 +836,7 @@ func postTestReport(bot *tgbotapi.BotAPI, conf Config, chatID int64, state Deadm
 }
 
 func runTestWatcher(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.Config) {
-	bot, _ := tgbotapi.NewBotAPI(conf.TelegramToken)
+	var bot *tgbotapi.BotAPI
 
 	nodeID := conf.NodeID
 	if idx := strings.LastIndex(nodeID, ":"); idx != -1 {
@@ -820,17 +861,33 @@ func runTestWatcher(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 		allDone := state.TestCurrentIdx >= len(state.TestNodes)
 		if allDone && !state.TestReportPosted && r.State() == raft.Leader {
 			chatID := effectiveChatID(conf, state)
-			if bot != nil && chatID != 0 {
-				postTestReport(bot, conf, chatID, state)
-				log.Printf("📋 TEST REPORT POSTED (seq=%d)", state.TestSeq)
+			reportPosted := false
+
+			if chatID != 0 {
+				if bot == nil {
+					bot = initBot(conf.TelegramToken)
+				}
+				if bot != nil {
+					postTestReport(bot, conf, chatID, state)
+					log.Printf("📋 TEST REPORT POSTED (seq=%d)", state.TestSeq)
+					reportPosted = true
+				} else {
+					log.Printf("⚠️ Could not post test report, Telegram bot not initialized. Retrying next tick.")
+					continue // Block Raft state change and force retry next tick
+				}
+			} else {
+				// No configured chat ID, just mark as posted to clear the test cycle
+				reportPosted = true
 			}
 
-			fsm.mu.RLock()
-			latest := fsm.state
-			fsm.mu.RUnlock()
-			latest.TestReportPosted = true
-			latest.TestInProgress = false
-			proposeState(r, latest)
+			if reportPosted {
+				fsm.mu.RLock()
+				latest := fsm.state
+				fsm.mu.RUnlock()
+				latest.TestReportPosted = true
+				latest.TestInProgress = false
+				proposeState(r, latest)
+			}
 			continue
 		}
 
@@ -943,7 +1000,7 @@ func runMonthlyTest(r *raft.Raft, fsm *DeadmanFSM, conf Config) {
 		chatID := effectiveChatID(conf, fsmState)
 
 		if chatID != 0 {
-			if bot, err := tgbotapi.NewBotAPI(conf.TelegramToken); err == nil {
+			if bot := initBot(conf.TelegramToken); bot != nil {
 				msg := newMsg(chatID, "🧪 *Monthly system test starting across all nodes…*")
 				msg.ParseMode = "Markdown"
 				sendMsg(bot, conf, msg)
@@ -1187,7 +1244,7 @@ func runControlLoop(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 						sendMsg(bot, conf, msg)
 					}
 				}
-				continue 
+				continue
 			}
 
 			if !isAuthorized(update.Message.From.ID, state.AuthorizedUserID, conf.AuthorizedUserIDs) {
@@ -1295,8 +1352,13 @@ func runControlLoop(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 					if pct < 0 {
 						pct = 0
 					}
+
+					// Reverse the offset to show the original query prompt
+					originalQuery := state.Answer - conf.AnswerOffset
+
 					statusLines = append(statusLines, fmt.Sprintf(
-						"🟢 *State:* Armed — `%s` remaining (%.1f%%)", timeLeft.Round(time.Second), pct))
+						"🟢 *State:* Armed — `%s` remaining (%.1f%%)\n❓ *Query:* `%d`",
+						timeLeft.Round(time.Second), pct, originalQuery))
 				} else if state.Triggered {
 					statusLines = append(statusLines, "💀 *State:* Triggered — payload has been executed")
 				} else {
@@ -1715,6 +1777,7 @@ func (t *TLSStreamLayer) Close() error {
 }
 
 type customAddr struct{ addr string }
+
 func (a customAddr) Network() string { return "tcp" }
 func (a customAddr) String() string  { return a.addr }
 
