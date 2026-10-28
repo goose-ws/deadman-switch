@@ -92,6 +92,11 @@ type DeadmanState struct {
 	TestNextNodeAt   int64             `json:"test_next_node_at"`
 	TestReportPosted bool              `json:"test_report_posted"`
 	TestTriggeredBy  string            `json:"test_triggered_by,omitempty"`
+
+	// Unix timestamp of the last *automatic* monthly test run, replicated
+	// via raft so any node - regardless of which one is leader or when it
+	// last restarted - can tell whether this month's run has happened yet.
+	LastMonthlyTestUnix int64 `json:"last_monthly_test_unix"`
 }
 
 type DeadmanFSM struct {
@@ -246,6 +251,28 @@ func parseDuration(s string) (time.Duration, error) {
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
 	return time.ParseDuration(s)
+}
+
+// addCalendarAware adds d to t. When d is a whole number of days (e.g. "14d"),
+// it moves by calendar days so the result lands on the same wall-clock time
+// even across a daylight-saving change; any other duration (e.g. "12h",
+// "90m") is added as exact elapsed time.
+func addCalendarAware(t time.Time, d time.Duration) time.Time {
+	const day = 24 * time.Hour
+	if d > 0 && d%day == 0 {
+		return t.AddDate(0, 0, int(d/day))
+	}
+	return t.Add(d)
+}
+
+// setDeadline arms the timer for d from now. OriginalDuration records the
+// real elapsed span (which can differ from d by an hour across a DST change)
+// so the warning-ratio and progress math stay consistent with Deadline.
+func setDeadline(state *DeadmanState, d time.Duration) {
+	now := time.Now()
+	end := addCalendarAware(now, d)
+	state.Deadline = end.Unix()
+	state.OriginalDuration = int64(end.Sub(now))
 }
 
 func sendSMTP(conf Config, subject, body string) error {
@@ -725,6 +752,10 @@ func initiateTest(r *raft.Raft, fsm *DeadmanFSM, conf Config, triggeredBy string
 	state.TestTriggeredBy = triggeredBy
 	state.TestNextNodeAt = time.Now().Unix()
 
+	if triggeredBy == "monthly" {
+		state.LastMonthlyTestUnix = time.Now().Unix()
+	}
+
 	if proposeState(r, state) {
 		log.Printf("🧪 TEST INITIATED (seq=%d, triggered_by=%s, nodes=%v)",
 			state.TestSeq, triggeredBy, nodes)
@@ -984,21 +1015,34 @@ func runTestWatcher(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 }
 
 func runMonthlyTest(r *raft.Raft, fsm *DeadmanFSM, conf Config) {
-	for {
-		now := time.Now()
-		next := time.Date(now.Year(), now.Month()+1, 1, 3, 0, 0, 0, now.Location())
-		log.Printf("🧪 MONTHLY TEST: Next run scheduled for %s", next.Format(time.RFC1123))
-		time.Sleep(time.Until(next))
-
+	// Polls hourly instead of sleeping until one exact instant. Whether the
+	// test has run "this month" is judged from LastMonthlyTestUnix in the
+	// replicated state, not from anything held in this goroutine's memory -
+	// so a restart or leadership change near the run window can't cause the
+	// test to be silently skipped, and it can't be double-run either.
+	checkAndRun := func() {
 		if r.State() != raft.Leader {
-			continue
+			return
 		}
 
 		fsm.mu.RLock()
 		fsmState := fsm.state
 		fsm.mu.RUnlock()
-		chatID := effectiveChatID(conf, fsmState)
 
+		now := time.Now()
+		dueSince := time.Date(now.Year(), now.Month(), 1, 3, 0, 0, 0, now.Location())
+		if now.Before(dueSince) {
+			return // this month's window hasn't opened yet
+		}
+
+		if fsmState.LastMonthlyTestUnix != 0 {
+			lastRun := time.Unix(fsmState.LastMonthlyTestUnix, 0)
+			if !lastRun.Before(dueSince) {
+				return // already ran since this month's window opened
+			}
+		}
+
+		chatID := effectiveChatID(conf, fsmState)
 		if chatID != 0 {
 			if bot := initBot(conf.TelegramToken); bot != nil {
 				msg := newMsg(chatID, "🧪 *Monthly system test starting across all nodes…*")
@@ -1008,6 +1052,16 @@ func runMonthlyTest(r *raft.Raft, fsm *DeadmanFSM, conf Config) {
 		}
 
 		initiateTest(r, fsm, conf, "monthly")
+	}
+
+	log.Printf("🧪 MONTHLY TEST: Watcher started - checking hourly whether this month's run is due.")
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	checkAndRun()
+	for range ticker.C {
+		checkAndRun()
 	}
 }
 
@@ -1082,9 +1136,8 @@ func runControlLoop(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 
 			state.Snoozed = false
 			state.Armed = true
-			state.Deadline = time.Now().Add(timerDuration).Unix()
+			setDeadline(&state, timerDuration)
 			state.Answer = q + conf.AnswerOffset
-			state.OriginalDuration = int64(timerDuration)
 			state.WarningLevel = 0
 			appendHistory(&state, "Armed (snooze wakeup)", conf.NodeID, 0)
 
@@ -1193,10 +1246,9 @@ func runControlLoop(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 						state.AuthorizedUserID = update.Message.From.ID
 						state.ChatID = targetChat
 						state.Armed = true
-						state.Deadline = time.Now().Add(timerDuration).Unix()
+						setDeadline(&state, timerDuration)
 						state.Answer = q + conf.AnswerOffset
 						state.Snoozed = false
-						state.OriginalDuration = int64(timerDuration)
 						state.WarningLevel = 0
 						appendHistory(&state, "Armed (initial)", conf.NodeID, update.Message.From.ID)
 
@@ -1266,10 +1318,9 @@ func runControlLoop(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 				q := cryptoRandIntn(200) + 50
 
 				state.Armed = true
-				state.Deadline = time.Now().Add(timerDuration).Unix()
+				setDeadline(&state, timerDuration)
 				state.Answer = q + conf.AnswerOffset
 				state.Snoozed = false
-				state.OriginalDuration = int64(timerDuration)
 				state.WarningLevel = 0
 				appendHistory(&state, "Armed", conf.NodeID, update.Message.From.ID)
 
@@ -1291,10 +1342,9 @@ func runControlLoop(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 				q := cryptoRandIntn(200) + 50
 				state.Armed = true
 				state.Disabled = false
-				state.Deadline = time.Now().Add(timerDuration).Unix()
+				setDeadline(&state, timerDuration)
 				state.Answer = q + conf.AnswerOffset
 				state.Snoozed = false
-				state.OriginalDuration = int64(timerDuration)
 				state.WarningLevel = 0
 				appendHistory(&state, "Armed (manual)", conf.NodeID, update.Message.From.ID)
 
@@ -1534,8 +1584,10 @@ func runControlLoop(r *raft.Raft, fsm *DeadmanFSM, conf Config, tlsConfig *tls.C
 					continue
 				}
 				q := cryptoRandIntn(200) + 50
-				state.Deadline += int64(extDur.Seconds())
-				state.OriginalDuration += int64(extDur)
+				oldEnd := time.Unix(state.Deadline, 0)
+				newEnd := addCalendarAware(oldEnd, extDur)
+				state.Deadline = newEnd.Unix()
+				state.OriginalDuration += int64(newEnd.Sub(oldEnd))
 				state.Answer = q + conf.AnswerOffset
 				state.WarningLevel = 0
 				state.FailureCount = 0
